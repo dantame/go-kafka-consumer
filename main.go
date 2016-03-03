@@ -18,7 +18,6 @@ import (
 
 var (
 	zookeepers = flag.String("zookeepers", os.Getenv("ZOOKEEPER_URLS"), "The comma seperated list of zookeeper instances")
-	topic      = flag.String("topic", "", "REQUIRED: the topic to consume")
 	partitions = flag.String("partitions", "all", "The partitions to consume, can be 'all' or comma-separated numbers")
 	offset     = flag.String("offset", "newest", "The offset to start with. Can be `oldest`, `newest`")
 	bufferSize = flag.Int("buffer-size", 256, "The buffer size of the message channel.")
@@ -38,7 +37,6 @@ func main() {
 	checkFlags()
 
 	consumeFromKafka()
-
 }
 
 func checkFlags() {
@@ -47,14 +45,14 @@ func checkFlags() {
 	if *zookeepers == "" {
 		printUsageErrorAndExit("You have to provide -zookeepers as a comma-separated list, or set the ZOOKEEPER_URLS environment variable")
 	}
-
-	if *topic == "" {
-		printUsageErrorAndExit("-topic is required")
-	}
 }
 
 func consumeFromKafka() {
-	brokerList := getBrokersFromZk()
+	conn := connectToZk()
+	defer conn.Close()
+
+	brokerList := getBrokersFromZk(conn)
+	topicList := getTopicsFromZk(conn)
 
 	var initialOffset int64
 	switch *offset {
@@ -67,9 +65,6 @@ func consumeFromKafka() {
 	}
 
 	consumer, err := sarama.NewConsumer(brokerList, nil)
-	must(err)
-
-	partitionList, err := getPartitions(consumer)
 	must(err)
 
 	var (
@@ -86,26 +81,31 @@ func consumeFromKafka() {
 		close(closing)
 	}()
 
-	for _, partition := range partitionList {
-		pc, err := consumer.ConsumePartition(*topic, partition, initialOffset)
+	for _, topic := range topicList {
+		partitionList, err := getPartitions(consumer, topic)
 		must(err)
+		for _, partition := range partitionList {
+			pc, err := consumer.ConsumePartition(topic, partition, initialOffset)
+			must(err)
 
-		go func(pc sarama.PartitionConsumer) {
-			<-closing
-			pc.AsyncClose()
-		}(pc)
+			go func(pc sarama.PartitionConsumer) {
+				<-closing
+				pc.AsyncClose()
+			}(pc)
 
-		wg.Add(1)
-		go func(pc sarama.PartitionConsumer) {
-			defer wg.Done()
-			for message := range pc.Messages() {
-				messages <- message
-			}
-		}(pc)
+			wg.Add(1)
+			go func(pc sarama.PartitionConsumer) {
+				defer wg.Done()
+				for message := range pc.Messages() {
+					messages <- message
+				}
+			}(pc)
+		}
 	}
 
 	go func() {
 		for msg := range messages {
+			fmt.Printf("Topic:\t%s\n", msg.Topic)
 			fmt.Printf("Partition:\t%d\n", msg.Partition)
 			fmt.Printf("Offset:\t%d\n", msg.Offset)
 			fmt.Printf("Key:\t%s\n", string(msg.Key))
@@ -115,7 +115,7 @@ func consumeFromKafka() {
 	}()
 
 	wg.Wait()
-	logger.Println("Done consuming topic", *topic)
+	logger.Println("Done consuming all topics")
 	close(messages)
 
 	if err := consumer.Close(); err != nil {
@@ -123,9 +123,9 @@ func consumeFromKafka() {
 	}
 }
 
-func getPartitions(c sarama.Consumer) ([]int32, error) {
+func getPartitions(c sarama.Consumer, topic string) ([]int32, error) {
 	if *partitions == "all" {
-		return c.Partitions(*topic)
+		return c.Partitions(topic)
 	}
 
 	tmp := strings.Split(*partitions, ",")
@@ -148,10 +148,14 @@ func connectToZk() *zk.Conn {
 	return conn
 }
 
-func getBrokersFromZk() []string {
-	conn := connectToZk()
-	defer conn.Close()
+func getTopicsFromZk(conn *zk.Conn) []string {
+	topics, _, err := conn.Children("/brokers/topics")
+	must(err)
 
+	return topics
+}
+
+func getBrokersFromZk(conn *zk.Conn) []string {
 	brokerIds, _, err := conn.Children("/brokers/ids")
 	must(err)
 
